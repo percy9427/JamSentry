@@ -14,16 +14,6 @@
 //    You should have received a copy of the GNU General Public License
 //    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-// Compile this using the arduino environment.  Version 1.8 or later
-// Under Tools/Board set the board to Adafruit HUZZAH ESP8266 from the drop down list
-// Set the COM port appropriately.  Make sure to put the board in load mode before compiling
-// Load additional libraries using Sketch/Include Library/Manage Libraries
-//    WiFiManager by tzapu (search, click more info, INSTALL)
-//    ArduinoJson by Benoit Blanchon (search, click more info, INSTALL)
-//    Adafruit Unified Sensor by Adafruit (search, click more info, INSTALL)
-//    Adafruit TSL2561 by Adafruit (search, click more info, INSTALL)
-//    Adafruit HMC5883 Unified by Adafruit (search, click more info, INSTALL)
-
 #include <FS.h>                   //this needs to be first, or it all crashes and burns...
 
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
@@ -481,66 +471,74 @@ void sendAlert(String hostToAlert, int portToAlert, String eventName) {  //Send 
   bool currentLineIsBlank = true;
   long now;
   bool avail;
+  #define MAX_ALERT_ATTEMPTS 3
+  int currentAttempt=0;
+  bool attemptSuccessful=false;
   delay(100);
-  WiFiClient client;
-  DynamicJsonBuffer jsonBuffer;
-  JsonObject& payload = jsonBuffer.createObject();
-  payload["value1"] = validated_printer_name;
-  if (flowState == STATE_TESTING) {
-    payload["value2"] = "TESTING";
-  }
-  else {
-    payload["value2"] = validated_extruder_id;
-  }
-  payload["value3"] = validated_remote_pause_password;
-  hostToAlert.toCharArray(gcode_sender_ip_addr, GCODE_SENDER_IP_ADDR_LEN);
-  if (client.connect(gcode_sender_ip_addr, portToAlert)) {
-    //Serial.println(".... connected to server");
-    String a = "";
-    char c;
-    int ch_count = 0;
-    delay(100);
-    Serial.println("POST /trigger/" + eventName + "/with/key/" + validated_ifttt_key);
-    client.print("POST /trigger/" + eventName + "/with/key/" + validated_ifttt_key);
-    client.println(" HTTP/1.1");
-    // Host header
-    client.print("Host:");
-    client.println(hostToAlert);
-    // JSON content type
-    client.println("Content-Type: application/json");
-    // Content length
-    int length = payload.measureLength();
-    client.print("Content-Length:");
-    client.println(length);
-    // End of headers
-    client.println();
-    // POST message body
-    String out;
-    payload.printTo(out);
-    //Serial.println(out);
-    client.println(out);
-    now = millis();
-    avail = false;
-    //Serial.println("starting timer");
-    while (millis() - now < 1500) {
-      while (client.available()) {
-        char c = client.read();
-        //Serial.print(c);
-        response = response + c;
-      }
-    }
-    if (response) {
-      Serial.println("IFTTT Successfully sent");
+  while (!attemptSuccessful & currentAttempt<MAX_ALERT_ATTEMPTS) {
+    WiFiClient client;
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& payload = jsonBuffer.createObject();
+    payload["value1"] = validated_printer_name;
+    if (flowState == STATE_TESTING) {
+      payload["value2"] = "TESTING";
     }
     else {
-      Serial.println("IFTTT Failed");
+      payload["value2"] = validated_extruder_id;
     }
-  }
-  else {
-    Serial.println("Cannot connect to IFTTT host");
-  }
-  client.stop();
-  delay(100);  
+    payload["value3"] = validated_remote_pause_password;
+    hostToAlert.toCharArray(gcode_sender_ip_addr, GCODE_SENDER_IP_ADDR_LEN);
+    if (client.connect(gcode_sender_ip_addr, portToAlert)) {
+      //Serial.println(".... connected to server");
+      String a = "";
+      char c;
+      int ch_count = 0;
+      delay(100);
+      Serial.println("POST /trigger/" + eventName + "/with/key/" + validated_ifttt_key);
+      client.print("POST /trigger/" + eventName + "/with/key/" + validated_ifttt_key);
+      client.println(" HTTP/1.1");
+      // Host header
+      client.print("Host:");
+      client.println(hostToAlert);
+      // JSON content type
+      client.println("Content-Type: application/json");
+      // Content length
+      int length = payload.measureLength();
+      client.print("Content-Length:");
+      client.println(length);
+      // End of headers
+      client.println();
+      // POST message body
+      String out;
+      payload.printTo(out);
+      //Serial.println(out);
+      client.println(out);
+      now = millis();
+      avail = false;
+      //Serial.println("starting timer");
+      while (millis() - now < 1500) {
+        while (client.available()) {
+          char c = client.read();
+          //Serial.print(c);
+          response = response + c;
+        }
+      }
+      if (response) {
+        Serial.println("IFTTT Successfully sent");
+        attemptSuccessful=true;
+      }
+      else {
+        Serial.println("IFTTT Failed");
+        currentAttempt++;
+      }
+    }
+    else {
+      Serial.println("Cannot connect to IFTTT host");
+      currentAttempt++;
+    }
+    client.stop();
+    delay(100);
+  }  
 }
 
 void performJamAction() {   //Do this when a Jam is detected
