@@ -49,7 +49,7 @@ bool writeData=false;
 char printer_name[PRINTER_NAME_LEN] = "Printer";
 char extruder_id[EXTRUDER_ID_LEN] = "1";
 char no_sync_timeout_secs[NO_SYNC_TIMEOUT_SECS_LEN] = "10";
-char mag_threshold[MAG_THRESHOLD_LEN]="AUTO";
+char mag_threshold[MAG_THRESHOLD_LEN]="1000";
 char alarm_condition[ALARM_CONDITION_LEN] = "LOW";
 char gcode_sender_ip_addr[GCODE_SENDER_IP_ADDR_LEN] = "Not used";
 char gcode_sender_port[GCODE_SENDER_PORT_LEN]= "27100";
@@ -80,7 +80,6 @@ const short int RUNOUT_ALARM = 15; //GPI15
 #define STATE_DISABLED 5
 #define STATE_NOT_WORKING 6
 #define STATE_TESTING 7
-#define STATE_CALIBRATING 8
 int flowState = STATE_IDLE;
 const int default_timeout = 10;   //Default timeout.  This is overwritten by whatever the user configures
 const int default_gcode_sender_port=27100;   //Default port for sending pause requests.  This is overwritten by whatever the user configures
@@ -88,13 +87,14 @@ const int default_gcode_sender_port=27100;   //Default port for sending pause re
 const long continuousExtrudingSamplesThreshold = 60*1000/MILLISECONDS_BETWEEN_SAMPLES;  //Must be extruding this long before job is considered started
 const long continuousIdleSamplesThreshold = 30*1000/MILLISECONDS_BETWEEN_SAMPLES;  //Must be idle this long before job is considered done
 const int luminosityChangeThreshold = 2;  //Required change in encoder luminosity to be considered running.
-float magnetometerChangeThreshold = -1;  //Required threshold of changing magnetic field.  Set dynamically during calibration step
+float magnetometerChangeThreshold = 1000;  //Required threshold of changing magnetic field. 
 
 //These contain the configured parameters after they have been validated
 String validated_printer_name = "Printer Name";
 String validated_extruder_id = "Extruder #";
 int validated_no_sync_timeout_secs = 0;
-long validated_mag_threshold = -1;
+#define DEFAULT_STEPPER_THRESHOLD 1000
+long validated_mag_threshold = DEFAULT_STEPPER_THRESHOLD;
 int validated_alarm_condition = LOW;  //RUNOUT_ALARM sent to this level when an alarm condition occurs
 int validated_noalarm_condition = HIGH;  //RUNOUT_ALARM normally at this level
 bool useRemoteGCodePause = false;  //Send pause alert to GCode Sender or not
@@ -113,7 +113,6 @@ String ipParseMessage = "";
 #define LUMINOSITY_ARRAY_SIZE 60*1000/MILLISECONDS_BETWEEN_SAMPLES
 int luminosityArray[LUMINOSITY_ARRAY_SIZE];
 #define MOTOR_ACTIVITY_ARRAY_SIZE 200
-#define STEPPER_MIN_AUTO_VALUE 400
 float motorActivityArray[MOTOR_ACTIVITY_ARRAY_SIZE];
 int numArrayCells = 0;
 int motorActivityIndex = 0;
@@ -136,9 +135,6 @@ float motorThresholdToBeConsideredExtruding = 5000;  //Computed based on samplin
 float maxMotorActivityCount = 10000; //Computed based on sampling speed.
 int jamWatchCount = 0;
 int testCount = 0;
-int calibrationStepsPerformed = 0;
-float peakCalibrationValue = 0;
-#define CALIBRATION_CYCLES_REQUIRED 30
 
 Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);  //Define the luminosity sensor
 
@@ -196,19 +192,8 @@ void setActivityThresholds(){  //Sets the various thresholds that guide the mach
   motorThresholdToBeConsideredIdle = 1 * 1000 / MILLISECONDS_BETWEEN_SAMPLES;
   motorThresholdToBeConsideredExtruding = validated_no_sync_timeout_secs * 1000 / MILLISECONDS_BETWEEN_SAMPLES;
   maxMotorActivityCount = motorThresholdToBeConsideredExtruding + 2 * 1000 / MILLISECONDS_BETWEEN_SAMPLES; 
-  if (validated_mag_threshold==-1) {
-    if (flowState!=STATE_NOT_WORKING) {
-      flowState=STATE_CALIBRATING;
-      Serial.println("State changed to STATE_CALIBRATING");
-      }
-    calibrationStepsPerformed=0;
-    peakCalibrationValue = 0;   
-  }
-  else {
-    magnetometerChangeThreshold=validated_mag_threshold;
-    flowState=STATE_IDLE;
-    Serial.println("State changed to STATE_IDLE");
-  }
+  magnetometerChangeThreshold=validated_mag_threshold;
+  if (flowState!=STATE_NOT_WORKING) {flowState=STATE_IDLE;}
   motorActivityCount=0;
   performUnjamAction;
 }
@@ -263,23 +248,23 @@ void validateConfigParms() {  //Performs some rudimentary (non exhaustive) check
   }
   configParseMessage += "\n";
   configParseMessage += "Supplied mag threshold was: \""  + mag_threshold_str + "\".\n";
-  if (mag_threshold_str == "AUTO" || mag_threshold_str == "Auto" || mag_threshold_str == "") {
-    validated_mag_threshold = -1;
-    configParseMessage += "Mag Threshold will be determined automatically\n";
-    Serial.println("Mag Threshold will be determined automatically. ");
+  if (mag_threshold_str  == "") {
+    validated_mag_threshold = DEFAULT_STEPPER_THRESHOLD;
+    configParseMessage += "Mag Threshold set to Default\n";
+    Serial.println("Mag Threshold set to Default. ");
   }
   else {
     validated_mag_threshold = mag_threshold_str.toInt();
   }
   if  (validated_mag_threshold <= 0) {
-    validated_mag_threshold = -1;
-    configParseMessage += "Mag Threshold must be >=0, so automatic used.\n";
-    Serial.println("Mag Threshold must be >=0, so automatic used ");
+    validated_mag_threshold = DEFAULT_STEPPER_THRESHOLD;
+    configParseMessage += "Mag Threshold must be >=0, so default value used.\n";
+    Serial.println("Mag Threshold must be >=0, so default value used ");
   }
   if  (validated_mag_threshold > 100000) {
-    validated_mag_threshold = -1;
-    configParseMessage += "Mag Threshold <= 100000 , so automatic used.\n";
-    Serial.println("Mag Threshold must be <=100000  , so automatic used. ");
+    validated_mag_threshold = DEFAULT_STEPPER_THRESHOLD;
+    configParseMessage += "Mag Threshold <= 100000 , so default value used.\n";
+    Serial.println("Mag Threshold must be <=100000  , so default value used. ");
   }
   configParseMessage += "\n";
   configParseMessage += "Supplied alarm condition was: \""  + alarm_condition_str + "\".\n";
@@ -431,20 +416,6 @@ void handleRoot() {  //This handles a root request to the server.
     operationStatus = "TESTING";
     backgroundOperationColor = "FFA500";
   }
-    else if (flowState == STATE_CALIBRATING) {
-    operationStatus = "CALIBRATING";
-    backgroundOperationColor = "C000FF";
-  }
-
-  String currMagValueStr="()";
-  if (calibrationStepsPerformed>=CALIBRATION_CYCLES_REQUIRED * 1000/MILLISECONDS_BETWEEN_SAMPLES) {
-    currMagValueStr="(" + String(magnetometerChangeThreshold) + ")";
-  }
-  String mag_threshold_str = "AUTO " + currMagValueStr;
-  if (validated_mag_threshold!=-1) {
-    mag_threshold_str=String(validated_mag_threshold);
-  }
-
   String alarm_str = "LOW";
   if (validated_alarm_condition == LOW) {
     alarm_str = "HIGH";
@@ -494,7 +465,7 @@ void handleRoot() {  //This handles a root request to the server.
                      "</p><table border=\"2\"><tr>Configuration Settings</tr><tr><td>Printer Name</td><td bgcolor=#ffffff>" + validated_printer_name +
                      "</td></tr><tr><td>Extruder</td><td bgcolor=#ffffff>" + validated_extruder_id +
                      "</td></tr></tr><td>Timeout in secs</td><td bgcolor=#ffffff>" + validated_no_sync_timeout_secs +
-                     "</td></tr></tr><td>Stepper Threshold</td><td bgcolor=#ffffff>" + mag_threshold_str +
+                     "</td></tr></tr><td>Stepper Threshold</td><td bgcolor=#ffffff>" + String(validated_mag_threshold) +
                      "</td></tr><tr><td>Alarm Condition</td><td bgcolor=#ffffff>" + alarm_str +
                      "</td></tr><tr><td>Gcode Sender IP Address</td><td bgcolor=#ffffff>" + gcode_sender_ip +
                      "</td></tr><tr><td>Gcode Sender Port</td><td bgcolor=#ffffff>" + String(validated_gcode_sender_port) +
@@ -842,7 +813,7 @@ void setup(void) {
   server.on("/", handleRoot);
 
   server.on("/update", []() {
-    String validated_mag_threshold_str = "AUTO";
+    String validated_mag_threshold_str = String(DEFAULT_STEPPER_THRESHOLD);
     if (validated_mag_threshold!=-1) {
       validated_mag_threshold_str=String(validated_mag_threshold);
     }
@@ -868,7 +839,7 @@ void setup(void) {
                          "<div class=\"container\"><form action = \"updateresults\" method=\"get\">Printer Name:<input type=\"text\" name=\"printer_name_update\" value=\"" + validated_printer_name +
                          "\"><br>Extruder ID:<input type=\"text\" name=\"extruder_id_update\" value=\"" + validated_extruder_id +
                          "\"><br>Mismatch Timeout in Secs:<input type=\"text\" name=\"validated_no_sync_timeout_secs_update\" value=\"" + String(validated_no_sync_timeout_secs) +
-                         "\"><br>Stepper Threshold or AUTO:<input type=\"text\" name=\"validated_mag_threshold_update\" value=\"" + validated_mag_threshold_str +
+                         "\"><br>Stepper Threshold:<input type=\"text\" name=\"validated_mag_threshold_update\" value=\"" + validated_mag_threshold_str +
                          "\"><br>Alarm Level High or Low:<input type=\"text\" name=\"alarm_condition_update\" value=\"" + alarm_str +
                          "\"><br>Gcode Sender IP Address (or blank to disable):<input type=\"text\" name=\"gcode_sender_ip_addr_update\" value=\"" + gcode_sender_ip +
                          "\"><br>Gcode Sender Port:<input type=\"text\" name=\"gcode_sender_port_update\" value=\"" + String(validated_gcode_sender_port) +
@@ -1134,27 +1105,6 @@ void loop()
         motorActivityCount = 0.0;
         flowState = STATE_IDLE;
         Serial.println("State changed to STATE_IDLE");
-      }
-    }
-    else if (flowState == STATE_CALIBRATING) {
-      calibrationStepsPerformed++;
-      if (calibrationStepsPerformed > CALIBRATION_CYCLES_REQUIRED * 1000/MILLISECONDS_BETWEEN_SAMPLES) {
-        if (800*peakCalibrationValue<STEPPER_MIN_AUTO_VALUE) {
-          magnetometerChangeThreshold=STEPPER_MIN_AUTO_VALUE;
-        }
-        else {
-          magnetometerChangeThreshold=800*peakCalibrationValue;          
-        }
-        Serial.print("Magnetometer Threshold Set To: "); Serial.println(magnetometerChangeThreshold); 
-        performUnjamAction();
-        motorActivityCount = 0.0;
-        flowState = STATE_IDLE;
-        Serial.println("State changed to STATE_IDLE");
-      }
-      else {
-        if (avgMagDiff>peakCalibrationValue & calibrationStepsPerformed>(1000/MILLISECONDS_BETWEEN_SAMPLES+1)) {
-          peakCalibrationValue=avgMagDiff;
-        }
       }
     }
   }
