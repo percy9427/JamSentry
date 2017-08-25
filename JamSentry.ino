@@ -22,7 +22,8 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
-#include <ESP8266mDNS.h>
+#include <ESP8266mDNS.h>namecheap
+
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -35,6 +36,7 @@
 #define PRINTER_NAME_LEN 40
 #define EXTRUDER_ID_LEN 40
 #define NO_SYNC_TIMEOUT_SECS_LEN 40
+#define MAG_THRESHOLD_LEN 40
 #define ALARM_CONDITION_LEN 40
 #define GCODE_SENDER_IP_ADDR_LEN 40
 #define GCODE_SENDER_PORT_LEN 40
@@ -43,10 +45,12 @@
 #define IFTTT_ALERT_IF_DONE_LEN 40
 #define STATIC_IP_LEN 40
 #define GATEWAY_IP_LEN 40
+bool writeData=false;
 char printer_name[PRINTER_NAME_LEN] = "Printer";
 char extruder_id[EXTRUDER_ID_LEN] = "1";
 char no_sync_timeout_secs[NO_SYNC_TIMEOUT_SECS_LEN] = "10";
-char alarm_condition[ALARM_CONDITION_LEN] = "HIGH";
+char mag_threshold[MAG_THRESHOLD_LEN]="AUTO";
+char alarm_condition[ALARM_CONDITION_LEN] = "LOW";
 char gcode_sender_ip_addr[GCODE_SENDER_IP_ADDR_LEN] = "Not used";
 char gcode_sender_port[GCODE_SENDER_PORT_LEN]= "27100";
 char remote_pause_password[REMOTE_PAUSE_PASSWORD_LEN] = "JamSentryPSWD";
@@ -58,7 +62,7 @@ char gateway_ip[GATEWAY_IP_LEN] = "Gateway IP Addr (or blank for DHCP)";
 bool tsl2561Exists=false;
 byte tsl2461I2CAddr=0x39;
 bool hcm5883Exists=false;
-byte hcm5883I2CAddr=0x1E;
+byte hcm5883I2CAddr=0x1E;  //Will try 0x0D if 0x1E doesn't work
 bool resetOrNot = false;
 float lightLevel = 0.0;
 bool shouldSaveConfig = false;  //flag for saving data
@@ -66,7 +70,7 @@ bool shouldSaveConfig = false;  //flag for saving data
 ESP8266WebServer server(80);  //The server is hosted at port 80 by the Jam Sentry
 
 const short int BUILTIN_LED1 = 0; //GPIO
-const short int RUNOUT_ALARM = 2; //GPIO2
+const short int RUNOUT_ALARM = 15; //GPI15
 //This state machine for JamSentry States.  State transitions are announced on the Serial Monitor
 #define STATE_IDLE 0
 #define STATE_POTENTIAL_EXTRUSION 1
@@ -76,21 +80,23 @@ const short int RUNOUT_ALARM = 2; //GPIO2
 #define STATE_DISABLED 5
 #define STATE_NOT_WORKING 6
 #define STATE_TESTING 7
+#define STATE_CALIBRATING 8
 int flowState = STATE_IDLE;
 const int default_timeout = 10;   //Default timeout.  This is overwritten by whatever the user configures
 const int default_gcode_sender_port=27100;   //Default port for sending pause requests.  This is overwritten by whatever the user configures
 #define MILLISECONDS_BETWEEN_SAMPLES 50  //Sampling rate.  The ESP8266 seems to be able to handle this speed
 const long continuousExtrudingSamplesThreshold = 60*1000/MILLISECONDS_BETWEEN_SAMPLES;  //Must be extruding this long before job is considered started
 const long continuousIdleSamplesThreshold = 30*1000/MILLISECONDS_BETWEEN_SAMPLES;  //Must be idle this long before job is considered done
-const float magnetometerChangeThreshold = 1000.0;  //Required threshold of changing magnetic field.  Typical values when extruding are >10000.  Typical values at rest<100
-const int luminosityChangeThreshold = 10;  //Required change in encoder luminosity to be considered running.
+const int luminosityChangeThreshold = 2;  //Required change in encoder luminosity to be considered running.
+float magnetometerChangeThreshold = -1;  //Required threshold of changing magnetic field.  Set dynamically during calibration step
 
 //These contain the configured parameters after they have been validated
 String validated_printer_name = "Printer Name";
 String validated_extruder_id = "Extruder #";
 int validated_no_sync_timeout_secs = 0;
-int validated_alarm_condition = HIGH;  //RUNOUT_ALARM sent to this level when an alarm condition occurs
-int validated_noalarm_condition = LOW;  //RUNOUT_ALARM normally at this level
+long validated_mag_threshold = -1;
+int validated_alarm_condition = LOW;  //RUNOUT_ALARM sent to this level when an alarm condition occurs
+int validated_noalarm_condition = HIGH;  //RUNOUT_ALARM normally at this level
 bool useRemoteGCodePause = false;  //Send pause alert to GCode Sender or not
 IPAddress validated_gcode_sender_ip_addr(0, 0, 0, 0);
 int validated_gcode_sender_port=27100;
@@ -104,9 +110,10 @@ IPAddress validated_gateway_ip(0, 0, 0, 0);
 
 String configParseMessage = "";
 String ipParseMessage = "";
-#define LUMINOSITY_ARRAY_SIZE 30*1000/MILLISECONDS_BETWEEN_SAMPLES
+#define LUMINOSITY_ARRAY_SIZE 60*1000/MILLISECONDS_BETWEEN_SAMPLES
 int luminosityArray[LUMINOSITY_ARRAY_SIZE];
 #define MOTOR_ACTIVITY_ARRAY_SIZE 200
+#define STEPPER_MIN_AUTO_VALUE 400
 float motorActivityArray[MOTOR_ACTIVITY_ARRAY_SIZE];
 int numArrayCells = 0;
 int motorActivityIndex = 0;
@@ -116,6 +123,7 @@ bool suppressEarlyAlarms = true;
 int alarmSuppressionTime = 20;
 int suppressionTimer = 0;
 int luminosityDifference = 0;
+float currMagDiff = 0;
 float avgMagDiff = 0;
 float previousXMagField = 0;
 float previousYMagField = 0;
@@ -128,6 +136,9 @@ float motorThresholdToBeConsideredExtruding = 5000;  //Computed based on samplin
 float maxMotorActivityCount = 10000; //Computed based on sampling speed.
 int jamWatchCount = 0;
 int testCount = 0;
+int calibrationStepsPerformed = 0;
+float peakCalibrationValue = 0;
+#define CALIBRATION_CYCLES_REQUIRED 30
 
 Adafruit_TSL2561_Unified tsl = Adafruit_TSL2561_Unified(TSL2561_ADDR_FLOAT, 12345);  //Define the luminosity sensor
 
@@ -160,6 +171,7 @@ void saveConfig() {  //Saves configuration parameters to disk.
   json["printer_name"] = printer_name;
   json["extruder_id"] = extruder_id;
   json["no_sync_timeout_secs"] = no_sync_timeout_secs;
+  json["mag_threshold"] = mag_threshold;
   json["alarm_condition"] = alarm_condition;
   json["gcode_sender_ip_addr"] = gcode_sender_ip_addr;
   json["gcode_sender_port"] = gcode_sender_port;
@@ -184,7 +196,19 @@ void setActivityThresholds(){  //Sets the various thresholds that guide the mach
   motorThresholdToBeConsideredIdle = 1 * 1000 / MILLISECONDS_BETWEEN_SAMPLES;
   motorThresholdToBeConsideredExtruding = validated_no_sync_timeout_secs * 1000 / MILLISECONDS_BETWEEN_SAMPLES;
   maxMotorActivityCount = motorThresholdToBeConsideredExtruding + 2 * 1000 / MILLISECONDS_BETWEEN_SAMPLES; 
-  if (flowState!=STATE_NOT_WORKING) {flowState=STATE_IDLE;}
+  if (validated_mag_threshold==-1) {
+    if (flowState!=STATE_NOT_WORKING) {
+      flowState=STATE_CALIBRATING;
+      Serial.println("State changed to STATE_CALIBRATING");
+      }
+    calibrationStepsPerformed=0;
+    peakCalibrationValue = 0;   
+  }
+  else {
+    magnetometerChangeThreshold=validated_mag_threshold;
+    flowState=STATE_IDLE;
+    Serial.println("State changed to STATE_IDLE");
+  }
   motorActivityCount=0;
   performUnjamAction;
 }
@@ -193,6 +217,7 @@ void validateConfigParms() {  //Performs some rudimentary (non exhaustive) check
   String printer_name_str(printer_name);
   String extruder_id_str(extruder_id);
   String no_sync_timeout_secs_str(no_sync_timeout_secs);
+  String mag_threshold_str(mag_threshold);
   String alarm_condition_str(alarm_condition);
   String gcode_sender_ip_addr_str(gcode_sender_ip_addr);
   String gcode_sender_port_str(gcode_sender_port);
@@ -231,22 +256,42 @@ void validateConfigParms() {  //Performs some rudimentary (non exhaustive) check
     configParseMessage += "Timeout value must be >=0, so default used: 10 secs.\n";
     Serial.println("Timeout value must be >=0, so default used: 10 secs ");
   }
-  if  (validated_no_sync_timeout_secs >= 30) {
-    validated_no_sync_timeout_secs = 30;
-    configParseMessage += "Timeout value must be <=30, so max used: 30 secs.\n";
-    Serial.println("Timeout value must be <=30, so max used: 30 secs ");
+  if  (validated_no_sync_timeout_secs > 60) {
+    validated_no_sync_timeout_secs = 60;
+    configParseMessage += "Timeout value must be <=60, so max used: 60 secs.\n";
+    Serial.println("Timeout value must be <=60, so max used: 60 secs ");
+  }
+  configParseMessage += "\n";
+  configParseMessage += "Supplied mag threshold was: \""  + mag_threshold_str + "\".\n";
+  if (mag_threshold_str == "AUTO" || mag_threshold_str == "Auto" || mag_threshold_str == "") {
+    validated_mag_threshold = -1;
+    configParseMessage += "Mag Threshold will be determined automatically\n";
+    Serial.println("Mag Threshold will be determined automatically. ");
+  }
+  else {
+    validated_mag_threshold = mag_threshold_str.toInt();
+  }
+  if  (validated_mag_threshold <= 0) {
+    validated_mag_threshold = -1;
+    configParseMessage += "Mag Threshold must be >=0, so automatic used.\n";
+    Serial.println("Mag Threshold must be >=0, so automatic used ");
+  }
+  if  (validated_mag_threshold > 100000) {
+    validated_mag_threshold = -1;
+    configParseMessage += "Mag Threshold <= 100000 , so automatic used.\n";
+    Serial.println("Mag Threshold must be <=100000  , so automatic used. ");
   }
   configParseMessage += "\n";
   configParseMessage += "Supplied alarm condition was: \""  + alarm_condition_str + "\".\n";
   if  (alarm_condition_str == "Alarm LOW" || alarm_condition_str == "LOW" || alarm_condition_str == "0") {
-    validated_alarm_condition = LOW;
-    validated_noalarm_condition = HIGH;
+    validated_alarm_condition = HIGH;  //The actual GPIO value is the opposite of the setting
+    validated_noalarm_condition = LOW; //The actual GPIO value is the opposite of the setting
     configParseMessage += "Alarm condition (level to set when jam detected) set to LOW.\n";
     Serial.println("Alarm condition set to LOW ");
   }
   else {
-    validated_alarm_condition = HIGH;
-    validated_noalarm_condition = LOW;
+    validated_alarm_condition = LOW; //The actual GPIO value is the opposite of the setting
+    validated_noalarm_condition = HIGH; //The actual GPIO value is the opposite of the setting
     configParseMessage += "Alarm condition (level to set when jam detected) set to HIGH.\n";
     Serial.println("Alarm condition set to HIGH ");
   }
@@ -386,9 +431,22 @@ void handleRoot() {  //This handles a root request to the server.
     operationStatus = "TESTING";
     backgroundOperationColor = "FFA500";
   }
+    else if (flowState == STATE_CALIBRATING) {
+    operationStatus = "CALIBRATING";
+    backgroundOperationColor = "C000FF";
+  }
+
+  String currMagValueStr="()";
+  if (calibrationStepsPerformed>=CALIBRATION_CYCLES_REQUIRED * 1000/MILLISECONDS_BETWEEN_SAMPLES) {
+    currMagValueStr="(" + String(magnetometerChangeThreshold) + ")";
+  }
+  String mag_threshold_str = "AUTO " + currMagValueStr;
+  if (validated_mag_threshold!=-1) {
+    mag_threshold_str=String(validated_mag_threshold);
+  }
 
   String alarm_str = "LOW";
-  if (validated_alarm_condition == HIGH) {
+  if (validated_alarm_condition == LOW) {
     alarm_str = "HIGH";
   }
   String firstButton = "<a href=\"disable\"><button class=\"button buttonEnable\">DISABLE</button></a>";
@@ -436,14 +494,14 @@ void handleRoot() {  //This handles a root request to the server.
                      "</p><table border=\"2\"><tr>Configuration Settings</tr><tr><td>Printer Name</td><td bgcolor=#ffffff>" + validated_printer_name +
                      "</td></tr><tr><td>Extruder</td><td bgcolor=#ffffff>" + validated_extruder_id +
                      "</td></tr></tr><td>Timeout in secs</td><td bgcolor=#ffffff>" + validated_no_sync_timeout_secs +
+                     "</td></tr></tr><td>Stepper Threshold</td><td bgcolor=#ffffff>" + mag_threshold_str +
                      "</td></tr><tr><td>Alarm Condition</td><td bgcolor=#ffffff>" + alarm_str +
                      "</td></tr><tr><td>Gcode Sender IP Address</td><td bgcolor=#ffffff>" + gcode_sender_ip +
                      "</td></tr><tr><td>Gcode Sender Port</td><td bgcolor=#ffffff>" + String(validated_gcode_sender_port) +
                      "</td></tr><tr><td>Remote Pause Password</td><td bgcolor=#ffffff>" + validated_remote_pause_password +
                      "</td></tr><tr><td>MAKER IFTT KEY</td><td bgcolor=#ffffff>" + key +
                      "</td></tr><tr><td>IFTTT Alert if Done</td><td bgcolor=#ffffff>" + iftttAlertIfDone +
-                     "</td></tr><tr><td>Static IP Addr</td><td bgcolor=#ffffff>" + staticIPAddr +
-                     "</td></tr><tr><td>Gateway IP Addr</td><td bgcolor=#ffffff>" + gatewayIPAddr +
+                     "</td></tr><tr><td>JamSentry IP Addr</td><td bgcolor=#ffffff>" + WiFi.localIP().toString()                                                                     +
                      "</td></tr></table><a href=\"log\"><button class=\"button buttonLog\">CONFIG LOG</button></a><p>" +
                      firstButton + "&nbsp<a href=\"update\"><button class=\"button buttonUpdate\">UPDATE CONFIG</button></a>"
                      "&nbsp<a href=\"test\"><button class=\"button buttonTest\">TEST JAM</button></a></p></body></html>";
@@ -459,7 +517,7 @@ void handleNotFound() {  //Unrecognized request eq. 192.168.1.99/invalid
   message += "\nArguments: ";
   message += server.args();
   message += "\n";
-  for (uint8_t i = 0; i < server.args(); i++) {
+  for (uint8_t i = 0; i < server.args(); i++) {                                                 
     message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
   }
   server.send(404, "text/plain", message);
@@ -471,10 +529,14 @@ void sendAlert(String hostToAlert, int portToAlert, String eventName) {  //Send 
   bool currentLineIsBlank = true;
   long now;
   bool avail;
-  #define MAX_ALERT_ATTEMPTS 3
+  #define MAX_ALERT_ATTEMPTS 8
   int currentAttempt=0;
   bool attemptSuccessful=false;
   delay(100);
+  String value3 = validated_remote_pause_password;
+  if (hostToAlert==IFTTTHOST) {
+    value3 = String(random(1000000));  //We need a random value for ITFFF otherwise, it will ignore a trigger that is the same as last time
+  }
   while (!attemptSuccessful & currentAttempt<MAX_ALERT_ATTEMPTS) {
     WiFiClient client;
     DynamicJsonBuffer jsonBuffer;
@@ -486,7 +548,7 @@ void sendAlert(String hostToAlert, int portToAlert, String eventName) {  //Send 
     else {
       payload["value2"] = validated_extruder_id;
     }
-    payload["value3"] = validated_remote_pause_password;
+    payload["value3"] = value3;
     hostToAlert.toCharArray(gcode_sender_ip_addr, GCODE_SENDER_IP_ADDR_LEN);
     if (client.connect(gcode_sender_ip_addr, portToAlert)) {
       //Serial.println(".... connected to server");
@@ -542,6 +604,7 @@ void sendAlert(String hostToAlert, int portToAlert, String eventName) {  //Send 
 }
 
 void performJamAction() {   //Do this when a Jam is detected
+  writeData=false;
   digitalWrite(RUNOUT_ALARM, validated_alarm_condition);
   Serial.println("JAMMED");
   if (useRemoteGCodePause) {
@@ -623,6 +686,7 @@ void setup(void) {
           strcpy(printer_name, json["printer_name"]);
           strcpy(extruder_id, json["extruder_id"]);
           strcpy(no_sync_timeout_secs, json["no_sync_timeout_secs"]);
+          strcpy(mag_threshold, json["mag_threshold"]);
           strcpy(alarm_condition, json["alarm_condition"]);
           strcpy(gcode_sender_ip_addr, json["gcode_sender_ip_addr"]);
           strcpy(gcode_sender_port, json["gcode_sender_port"]);
@@ -739,7 +803,11 @@ void setup(void) {
     Serial.println("State changed to STATE_NOT_WORKING");
   }
   
+  hcm5883Exists = false;
   if (checkI2CAddr(hcm5883I2CAddr)) {
+    hcm5883Exists=true;
+  }
+  if (hcm5883Exists) {
     if (!mag.begin())
     {
       /* There was a problem detecting the HMC5883 ... check your connections */
@@ -749,13 +817,11 @@ void setup(void) {
       Serial.println("State changed to STATE_NOT_WORKING");
     }
     else {
-      hcm5883Exists = true;
       Serial.println("Magnetometer Sensor Found");
     }
   }
   else {
-    hcm5883Exists = false;
-    flowState = STATE_NOT_WORKING;
+     flowState = STATE_NOT_WORKING;
     Serial.println("State changed to STATE_NOT_WORKING");    
   }
 
@@ -776,8 +842,12 @@ void setup(void) {
   server.on("/", handleRoot);
 
   server.on("/update", []() {
+    String validated_mag_threshold_str = "AUTO";
+    if (validated_mag_threshold!=-1) {
+      validated_mag_threshold_str=String(validated_mag_threshold);
+    }
     String alarm_str = "LOW";
-    if (validated_alarm_condition == HIGH) {
+    if (validated_alarm_condition == LOW) {
       alarm_str = "HIGH";
     }
     String gcode_sender_ip = "Not used";
@@ -798,6 +868,7 @@ void setup(void) {
                          "<div class=\"container\"><form action = \"updateresults\" method=\"get\">Printer Name:<input type=\"text\" name=\"printer_name_update\" value=\"" + validated_printer_name +
                          "\"><br>Extruder ID:<input type=\"text\" name=\"extruder_id_update\" value=\"" + validated_extruder_id +
                          "\"><br>Mismatch Timeout in Secs:<input type=\"text\" name=\"validated_no_sync_timeout_secs_update\" value=\"" + String(validated_no_sync_timeout_secs) +
+                         "\"><br>Stepper Threshold or AUTO:<input type=\"text\" name=\"validated_mag_threshold_update\" value=\"" + validated_mag_threshold_str +
                          "\"><br>Alarm Level High or Low:<input type=\"text\" name=\"alarm_condition_update\" value=\"" + alarm_str +
                          "\"><br>Gcode Sender IP Address (or blank to disable):<input type=\"text\" name=\"gcode_sender_ip_addr_update\" value=\"" + gcode_sender_ip +
                          "\"><br>Gcode Sender Port:<input type=\"text\" name=\"gcode_sender_port_update\" value=\"" + String(validated_gcode_sender_port) +
@@ -818,13 +889,17 @@ void setup(void) {
     server.arg(0).toCharArray(printer_name, PRINTER_NAME_LEN);
     server.arg(1).toCharArray(extruder_id, EXTRUDER_ID_LEN);
     server.arg(2).toCharArray(no_sync_timeout_secs, NO_SYNC_TIMEOUT_SECS_LEN);
-    server.arg(3).toCharArray(alarm_condition, ALARM_CONDITION_LEN);
-    server.arg(4).toCharArray(gcode_sender_ip_addr, GCODE_SENDER_IP_ADDR_LEN);
-    server.arg(5).toCharArray(gcode_sender_port, GCODE_SENDER_PORT_LEN);
-    server.arg(6).toCharArray(remote_pause_password, REMOTE_PAUSE_PASSWORD_LEN);
-    server.arg(7).toCharArray(ifttt_key, IFTTT_KEY_LEN);
-    server.arg(8).toCharArray(ifttt_alert_if_done, IFTTT_ALERT_IF_DONE_LEN);
+    server.arg(3).toCharArray(mag_threshold, MAG_THRESHOLD_LEN);
+    server.arg(4).toCharArray(alarm_condition, ALARM_CONDITION_LEN);
+    server.arg(5).toCharArray(gcode_sender_ip_addr, GCODE_SENDER_IP_ADDR_LEN);
+    server.arg(6).toCharArray(gcode_sender_port, GCODE_SENDER_PORT_LEN);
+    server.arg(7).toCharArray(remote_pause_password, REMOTE_PAUSE_PASSWORD_LEN);
+    server.arg(8).toCharArray(ifttt_key, IFTTT_KEY_LEN);
+    server.arg(9).toCharArray(ifttt_alert_if_done, IFTTT_ALERT_IF_DONE_LEN);
     validateConfigParms();
+    //Set the alarm output appropriately
+    digitalWrite(RUNOUT_ALARM, validated_noalarm_condition); // Set the unalarmed state
+
     saveConfig();
     handleRoot();
   });
@@ -859,8 +934,7 @@ void setup(void) {
 
   server.on("/enable", []() {
     if (flowState != STATE_NOT_WORKING) {
-      Serial.println("State changed to STATE_IDLE");
-      flowState = STATE_IDLE;
+      setActivityThresholds();
     }
     handleRoot();
   });
@@ -904,13 +978,12 @@ void loop()
     previousXMagField = event.magnetic.x;
     previousYMagField = event.magnetic.y;
     previousZMagField = event.magnetic.z;
-    motorActivityArray[motorActivityIndex] = diffXSq + diffYSq + diffZSq;
+    currMagDiff= diffXSq + diffYSq + diffZSq;
+    motorActivityArray[motorActivityIndex] = currMagDiff;
     if (++motorActivityIndex >= numMotorSamples) {
       motorActivityIndex = 0;
     }
     avgMagDiff = getMotorActivity();
-//    Serial.print("X: "); Serial.print(event.magnetic.x); Serial.print(",  Y: ");  Serial.print(event.magnetic.y); Serial.print(",  Z: ");  Serial.print(event.magnetic.z); Serial.print(",  Diff: ");  Serial.println(avgMagDiff);
-
     tsl.getEvent(&event);
     if (event.light) {
       lightLevel = event.light;
@@ -926,6 +999,10 @@ void loop()
   }
   bool motorMoving = (avgMagDiff >= magnetometerChangeThreshold);
   bool filamentMoving = !isFilamentStopped();
+  if (writeData) {
+    Serial.print("Light: "); Serial.print(lightLevel); Serial.print(", LAvg: "); Serial.print(luminosityDifference); Serial.print(", CurrMagDiff: "); Serial.print(currMagDiff);  Serial.print(",  Avg: ");  Serial.println(avgMagDiff);
+//      Serial.print("X: "); Serial.print(event.magnetic.x); Serial.print(",  Y: ");  Serial.print(event.magnetic.y); Serial.print(",  Z: ");  Serial.print(event.magnetic.z); Serial.print(",  Diff: ");  Serial.println(avgMagDiff);
+  }
   //  Serial.print(luminosityIndex); Serial.print("  "); Serial.println(luminosityArray[luminosityIndex]);
   //  /* Display the results from the Sensors */
   //Serial.print("Mag diff: "); Serial.print(avgMagDiff); Serial.print(",  Luminosity: ");  Serial.print(lightLevel); Serial.print(",  Motor Activity Count: ");  Serial.println(motorActivityCount);
@@ -933,7 +1010,7 @@ void loop()
   if (flowState != STATE_DISABLED & flowState != STATE_NOT_WORKING) {
     if (flowState == STATE_IDLE) {
       ++continuousIdleSamples;
-      Serial.print("Continuous Idle: "); Serial.print(continuousIdleSamples); Serial.print(", Continuous Extruding: "); Serial.println(continuousExtrudingSamples);
+//      Serial.print("Continuous Idle: "); Serial.print(continuousIdleSamples); Serial.print(", Continuous Extruding: "); Serial.println(continuousExtrudingSamples);
       if (continuousIdleSamples>=continuousIdleSamplesThreshold & continuousExtrudingSamples>=continuousExtrudingSamplesThreshold) {
         if (useIFTTT & validated_ifttt_alert_if_done) {
           sendAlert(IFTTTHOST,IFTTTPORT,"Done");
@@ -1038,7 +1115,7 @@ void loop()
         flowState = STATE_IDLE;
         motorActivityCount = 0.0;
         Serial.println("State changed to STATE_IDLE");
-          performUnjamAction();
+        performUnjamAction();
         }
       }
       if (flowState == STATE_JAMMED) {
@@ -1057,6 +1134,27 @@ void loop()
         motorActivityCount = 0.0;
         flowState = STATE_IDLE;
         Serial.println("State changed to STATE_IDLE");
+      }
+    }
+    else if (flowState == STATE_CALIBRATING) {
+      calibrationStepsPerformed++;
+      if (calibrationStepsPerformed > CALIBRATION_CYCLES_REQUIRED * 1000/MILLISECONDS_BETWEEN_SAMPLES) {
+        if (800*peakCalibrationValue<STEPPER_MIN_AUTO_VALUE) {
+          magnetometerChangeThreshold=STEPPER_MIN_AUTO_VALUE;
+        }
+        else {
+          magnetometerChangeThreshold=800*peakCalibrationValue;          
+        }
+        Serial.print("Magnetometer Threshold Set To: "); Serial.println(magnetometerChangeThreshold); 
+        performUnjamAction();
+        motorActivityCount = 0.0;
+        flowState = STATE_IDLE;
+        Serial.println("State changed to STATE_IDLE");
+      }
+      else {
+        if (avgMagDiff>peakCalibrationValue & calibrationStepsPerformed>(1000/MILLISECONDS_BETWEEN_SAMPLES+1)) {
+          peakCalibrationValue=avgMagDiff;
+        }
       }
     }
   }
