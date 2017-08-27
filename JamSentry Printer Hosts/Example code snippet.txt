@@ -1,0 +1,55 @@
+#This is an example of python code that allows the Printer Host to receive
+#and process Pause requests from JamSentry.  It is written in Python 2.7 because
+#that is what Lulzbot Cura uses.
+
+from BaseHTTPServer import BaseHTTPRequestHandler,HTTPServer
+import json
+
+PORT_FOR_REMOTE_PAUSE=27100 #Must match the port set in JamSentry
+PASSWORD_FOR_REMOTE_PAUSE="JamSentryPSWD"  #Must match the password set in JamSentry
+
+def iftttHandler(serialObj):  #Note: This stuff all breaks in Python 3 because the base classes change
+    class CustomHandler(BaseHTTPRequestHandler, object):
+        def __init__(self, *args, **kwargs):
+            super(CustomHandler, self).__init__(*args, **kwargs)
+            
+                #Handler for the GET requests
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-type','text/html')
+            self.end_headers()
+            self.wfile.write("<html><body><h1>GET!</h1></body></html>")
+            return
+
+        def do_POST(self):
+            # Send the html message
+            try:
+                content_length = int(self.headers['Content-Length']) # <--- Gets the size of data
+                post_data = self.rfile.read(content_length) # <--- Gets the data itself
+                receivedFields=json.loads(post_data.decode("utf-8"))
+                reportingMachine=receivedFields['value1']
+                reportingExtruder=receivedFields['value2']
+                passwordToMatch=receivedFields['value3']
+                if passwordToMatch==PASSWORD_FOR_REMOTE_PAUSE: #Only pause if the remote request has a matching password
+                    serialObj.pause(True)
+                self.send_response(200)
+                self.send_header('Content-type','text/html')
+                self.end_headers()
+                self.wfile.write("<html><body><h1>POST!</h1></body></html>")
+            except:
+                pass
+            return
+    return CustomHandler
+	
+#Code snippet for starting the server.  In the case of Lulzbot cura, it is associated with an
+#object class serialObj
+	
+	def _waitForIFTTTQuery():
+		server_address = ('', PORT_FOR_REMOTE_PAUSE)
+		serialObj=self
+		HandlerClass = iftttHandler(serialObj)
+		self._server = HTTPServer(server_address, HandlerClass)
+		self._server.serve_forever()		
+
+
+	
